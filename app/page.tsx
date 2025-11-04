@@ -13,6 +13,8 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { SystemProgram, Transaction, PublicKey } from "@solana/web3.js";
 
 interface Post {
   id: string;
@@ -25,6 +27,8 @@ export default function Home() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [newPost, setNewPost] = useState("");
   const [loading, setLoading] = useState(false);
+  const { connection } = useConnection();
+  const { publicKey, signTransaction } = useWallet();
 
   // Fetch posts from backend
   const fetchPosts = async () => {
@@ -40,22 +44,110 @@ export default function Home() {
   // Create new post
   const handleCreatePost = async () => {
     if (!newPost.trim()) return;
+
+    if (!publicKey) {
+      alert("Please connect your Solana wallet first!");
+      return;
+    }
+
+    if (!signTransaction) {
+      alert("Wallet does not support signing transactions");
+      return;
+    }
+
     setLoading(true);
 
     try {
-      const res = await fetch("/api/posts", {
+      // Step 1: Request payment quote (will get 402)
+      let res = await fetch("/api/posts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: newPost }),
       });
 
-      if (!res.ok) throw new Error("Failed to create post");
+      if (res.status !== 402) {
+        throw new Error("Expected payment request");
+      }
 
-      const post = await res.json();
-      setPosts((prev) => [post, ...prev]); // Add new post at top
+      alert("402 Payment required! Preparing transaction...");
+
+      const quote = await res.json();
+      console.log("Payment required:", quote.payment);
+
+      // Step 2: Create payment transaction
+      const { blockhash, lastValidBlockHeight } =
+        await connection.getLatestBlockhash();
+
+      const transaction = new Transaction({
+        feePayer: publicKey,
+        blockhash,
+        lastValidBlockHeight,
+      }).add(
+        SystemProgram.transfer({
+          fromPubkey: publicKey,
+          toPubkey: new PublicKey(quote.payment.recipient),
+          lamports: quote.payment.amount,
+        })
+      );
+
+      // Step 3: Sign transaction (but don't send it!)
+      const signedTx = await signTransaction(transaction);
+
+      // Step 4: Serialize the signed transaction
+      const serializedTx = signedTx.serialize().toString("base64");
+
+      // Step 5: Create x402 payment proof
+      const paymentProof = {
+        x402Version: 1,
+        scheme: "exact",
+        network:
+          quote.payment.cluster === "devnet"
+            ? "solana-devnet"
+            : "solana-mainnet",
+        payload: {
+          serializedTransaction: serializedTx,
+        },
+      };
+
+      // Step 6: Encode payment proof as base64
+      const xPaymentHeader = btoa(JSON.stringify(paymentProof));
+
+      console.log("Sending payment proof to server...");
+
+      // Step 7: Retry post with X-Payment header
+      res = await fetch("/api/posts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Payment": xPaymentHeader,
+        },
+        body: JSON.stringify({ text: newPost }),
+      });
+
+      if (!res.ok) {
+        const error = await res.json();
+        throw new Error(error.error || "Failed to create post");
+      }
+
+      const result = await res.json();
+
+      console.log("✅ Post created!", result);
+      console.log("🔗 Transaction:", result.paymentDetails.explorerUrl);
+
+      // Update UI
+      setPosts((prev) => [result.post, ...prev]);
       setNewPost("");
+
+      // Show success message with explorer link
+      alert(
+        `Roast posted! 🔥\n\nTransaction: ${result.paymentDetails.signature.slice(
+          0,
+          8
+        )}...`
+      );
     } catch (err) {
-      console.error(err);
+      console.error("Error:", err);
+      alert(`Failed to create post: ${(err as Error).message}`);
     } finally {
       setLoading(false);
     }
